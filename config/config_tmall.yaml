@@ -62,7 +62,7 @@ device:
   
 # Logging settings
 logging:
-  save_dir: "./checkpoints/"
+  save_dir: "./checkpoints_tmall/"
   log_interval: 100
   tensorboard: true
   
