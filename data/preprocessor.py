@@ -1,316 +1,74 @@
+import os
+import pickle
+from abc import ABC, abstractmethod
+from collections import Counter, defaultdict
+from datetime import timedelta
+from typing import Dict, List, Tuple, Any
+
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
-import pickle
 from tqdm import tqdm
-import os
-from collections import defaultdict
+import itertools
+
+# --- New Imports for Parallelism ---
+from pandarallel import pandarallel
+from joblib import Parallel, delayed
+import multiprocessing
+
+# --- Initialize pandarallel ---
+# This will allow us to use .parallel_apply() on DataFrames
+pandarallel.initialize(progress_bar=True, nb_workers=multiprocessing.cpu_count())
 
 
-class TmallPreprocessor:
-    """Preprocessor for Tmall dataset"""
+def _process_graph_chunk(
+    session_items: List[int], window_size: int
+) -> Tuple[Dict, Dict]:
+    """Helper function to process one session for graph creation. Runs in a separate process."""
+    cooccurrence = defaultdict(lambda: defaultdict(int))
+    transition = defaultdict(lambda: defaultdict(int))
 
-    def __init__(self, config):
+    # Transitions (item_i -> item_{i+1})
+    for i in range(len(session_items) - 1):
+        transition[session_items[i]][session_items[i + 1]] += 1
+
+    # Co-occurrence within a sliding window
+    for i in range(len(session_items)):
+        for j in range(i + 1, min(i + window_size + 1, len(session_items))):
+            u, v = session_items[i], session_items[j]
+            cooccurrence[u][v] += 1
+            cooccurrence[v][u] += 1
+
+    return dict(cooccurrence), dict(transition)
+
+
+class BasePreprocessor(ABC):
+    """
+    Abstract Base Class for session data preprocessing.
+    (Code from previous optimization is kept, with parallel versions of methods)
+    """
+
+    def __init__(self, config: Dict):
         self.config = config
-        self.min_session_length = config["dataset"]["min_session_length"]
-        self.min_item_frequency = config["dataset"]["min_item_frequency"]
-        self.test_days = config["dataset"]["test_days"]
+        self.min_session_length: int = config["dataset"]["min_session_length"]
+        self.min_item_frequency: int = config["dataset"]["min_item_frequency"]
+        self.test_days: int = config["dataset"]["test_days"]
+        self.validation_split: float = config["dataset"]["validation_split"]
+        self.cooccurrence_window: int = config["dataset"].get("cooccurrence_window", 3)
 
-    def load_raw_data(self, file_path):
-        """Load raw Tmall data"""
-        print("Loading raw data...")
+    @abstractmethod
+    def load_raw_data(self, file_path: str) -> pd.DataFrame:
+        pass
 
-        # Tmall format: user_id, item_id, category_id, behavior_type, timestamp
-        columns = ["user_id", "item_id", "category_id", "behavior_type", "timestamp"]
-        data = pd.read_csv(file_path, sep=",", header=None, names=columns)
+    @abstractmethod
+    def create_sessions(self, data: pd.DataFrame) -> pd.DataFrame:
+        pass
 
-        # Filter only click behaviors (behavior_type == 0)
-        data = data[data["behavior_type"] == 0]
-
-        # Convert timestamp
-        data["timestamp"] = pd.to_datetime(data["timestamp"], unit="s")
-
-        return data
-
-    def create_sessions(self, data):
-        """Create sessions from user interactions"""
-        print("Creating sessions...")
-
-        # Sort by user and timestamp
-        data = data.sort_values(["user_id", "timestamp"])
-
-        sessions = []
-        session_id = 0
-
-        # Group by user
-        for user_id, user_data in tqdm(data.groupby("user_id")):
-            user_data = user_data.sort_values("timestamp")
-
-            # Split into sessions (30-minute gap)
-            session_start_time = user_data.iloc[0]["timestamp"]
-            current_session = []
-
-            for _, row in user_data.iterrows():
-                if row["timestamp"] - session_start_time > timedelta(minutes=30):
-                    if len(current_session) >= self.min_session_length:
-                        sessions.append(
-                            {
-                                "session_id": session_id,
-                                "user_id": user_id,
-                                "items": current_session.copy(),
-                                "timestamp": session_start_time,
-                            }
-                        )
-                        session_id += 1
-
-                    current_session = [row["item_id"]]
-                    session_start_time = row["timestamp"]
-                else:
-                    current_session.append(row["item_id"])
-
-            # Add last session
-            if len(current_session) >= self.min_session_length:
-                sessions.append(
-                    {
-                        "session_id": session_id,
-                        "user_id": user_id,
-                        "items": current_session,
-                        "timestamp": session_start_time,
-                    }
-                )
-                session_id += 1
-
-        return pd.DataFrame(sessions)
-
-    def filter_items(self, sessions_df):
-        """Filter items by frequency"""
+    def filter_items(self, sessions_df: pd.DataFrame) -> pd.DataFrame:
+        """Filter out items with low frequency and sessions that become too short."""
         print("Filtering items by frequency...")
 
-        # Count item frequencies
-        item_counts = defaultdict(int)
-        for items in sessions_df["items"]:
-            for item in items:
-                item_counts[item] += 1
-
-        # Filter items
-        valid_items = {
-            item
-            for item, count in item_counts.items()
-            if count >= self.min_item_frequency
-        }
-
-        # Filter sessions
-        filtered_sessions = []
-        for _, row in sessions_df.iterrows():
-            filtered_items = [item for item in row["items"] if item in valid_items]
-            if len(filtered_items) >= self.min_session_length:
-                row["items"] = filtered_items
-                filtered_sessions.append(row)
-
-        return pd.DataFrame(filtered_sessions)
-
-    def create_item_mapping(self, sessions_df):
-        """Create item ID mapping"""
-        print("Creating item mapping...")
-
-        # Get all unique items
-        all_items = set()
-        for items in sessions_df["items"]:
-            all_items.update(items)
-
-        # Create mapping (reserve 0 for padding)
-        item_to_id = {item: idx + 1 for idx, item in enumerate(sorted(all_items))}
-        id_to_item = {idx: item for item, idx in item_to_id.items()}
-
-        # Apply mapping
-        sessions_df["items"] = sessions_df["items"].apply(
-            lambda x: [item_to_id[item] for item in x]
-        )
-
-        return sessions_df, item_to_id, id_to_item
-
-    def split_data(self, sessions_df):
-        """Split data into train/validation/test sets"""
-        print("Splitting data...")
-
-        # Sort by timestamp
-        sessions_df = sessions_df.sort_values("timestamp")
-
-        # Split by time
-        test_start_time = sessions_df["timestamp"].max() - timedelta(
-            days=self.test_days
-        )
-
-        test_data = sessions_df[sessions_df["timestamp"] >= test_start_time]
-        train_val_data = sessions_df[sessions_df["timestamp"] < test_start_time]
-
-        # Split train/validation
-        val_size = int(len(train_val_data) * self.config["dataset"]["validation_split"])
-        val_data = train_val_data.tail(val_size)
-        train_data = train_val_data.head(len(train_val_data) - val_size)
-
-        return train_data, val_data, test_data
-
-    def create_global_graph_data(self, train_sessions):
-        """Create data for global graph construction"""
-        print("Creating global graph data...")
-
-        # Item co-occurrence within sessions
-        cooccurrence = defaultdict(lambda: defaultdict(int))
-        transition = defaultdict(lambda: defaultdict(int))
-
-        for items in tqdm(train_sessions["items"]):
-            # Co-occurrence
-            for i in range(len(items)):
-                for j in range(i + 1, min(i + 4, len(items))):  # Window of 3
-                    cooccurrence[items[i]][items[j]] += 1
-                    cooccurrence[items[j]][items[i]] += 1
-
-            # Transitions
-            for i in range(len(items) - 1):
-                transition[items[i]][items[i + 1]] += 1
-
-        return dict(cooccurrence), dict(transition)
-
-    def save_processed_data(
-        self,
-        output_dir,
-        train_data,
-        val_data,
-        test_data,
-        item_to_id,
-        id_to_item,
-        global_graph_data,
-    ):
-        """Save processed data"""
-        print("Saving processed data...")
-
-        os.makedirs(output_dir, exist_ok=True)
-
-        # Save session data
-        train_data.to_pickle(os.path.join(output_dir, "train.pkl"))
-        val_data.to_pickle(os.path.join(output_dir, "validation.pkl"))
-        test_data.to_pickle(os.path.join(output_dir, "test.pkl"))
-
-        # Save mappings
-        with open(os.path.join(output_dir, "item_mappings.pkl"), "wb") as f:
-            pickle.dump(
-                {
-                    "item_to_id": item_to_id,
-                    "id_to_item": id_to_item,
-                    "num_items": len(item_to_id),
-                },
-                f,
-            )
-
-        # Save global graph data
-        with open(os.path.join(output_dir, "global_graph_data.pkl"), "wb") as f:
-            pickle.dump(global_graph_data, f)
-
-        # Save statistics
-        stats = {
-            "num_sessions": len(train_data) + len(val_data) + len(test_data),
-            "num_train_sessions": len(train_data),
-            "num_val_sessions": len(val_data),
-            "num_test_sessions": len(test_data),
-            "num_items": len(item_to_id),
-            "avg_session_length": np.mean([len(s) for s in train_data["items"]]),
-        }
-
-        with open(os.path.join(output_dir, "stats.pkl"), "wb") as f:
-            pickle.dump(stats, f)
-
-        print(f"Data preprocessing completed!")
-        print(f"Statistics: {stats}")
-
-    def process(self, input_file, output_dir):
-        """Main preprocessing pipeline"""
-        # Load data
-        data = self.load_raw_data(input_file)
-
-        # Create sessions
-        sessions_df = self.create_sessions(data)
-
-        # Filter items
-        sessions_df = self.filter_items(sessions_df)
-
-        # Create item mapping
-        sessions_df, item_to_id, id_to_item = self.create_item_mapping(sessions_df)
-
-        # Split data
-        train_data, val_data, test_data = self.split_data(sessions_df)
-
-        # Create global graph data
-        global_graph_data = self.create_global_graph_data(train_data)
-
-        # Save data
-        self.save_processed_data(
-            output_dir,
-            train_data,
-            val_data,
-            test_data,
-            item_to_id,
-            id_to_item,
-            global_graph_data,
-        )
-
-        return train_data, val_data, test_data
-
-
-class YoochoosePreprocessor:
-    """Preprocessor for the Yoochoose dataset."""
-
-    def __init__(self, config):
-        self.config = config
-        # Get settings from the config file
-        self.min_session_length = config["dataset"]["min_session_length"]
-        self.min_item_frequency = config["dataset"]["min_item_frequency"]
-        self.test_days = config["dataset"]["test_days"]
-        self.validation_split = config["dataset"]["validation_split"]
-
-    def load_raw_data(self, file_path):
-        """Load raw Yoochoose data (yoochoose-clicks.dat)"""
-        print("Loading raw Yoochoose data...")
-        columns = ["session_id", "timestamp", "item_id", "category"]
-        data = pd.read_csv(
-            file_path, header=None, names=columns, dtype={"category": str}
-        )
-
-        # Convert timestamp to datetime objects
-        data["timestamp"] = pd.to_datetime(data["timestamp"])
-        return data
-
-    def create_sessions(self, data):
-        """
-        Create sessions from raw data. Yoochoose already has session_id,
-        so we just group by it.
-        """
-        print("Creating sessions...")
-        # Sort by session and time to ensure items are in the correct order
-        data = data.sort_values(["session_id", "timestamp"])
-
-        sessions = []
-        # Group by session_id
-        for session_id, session_data in tqdm(data.groupby("session_id")):
-            # Ensure the session meets the minimum length requirement
-            if len(session_data) >= self.min_session_length:
-                sessions.append(
-                    {
-                        "session_id": session_id,
-                        "user_id": session_id,  # Use session_id as user_id for consistency
-                        "items": session_data["item_id"].tolist(),
-                        "timestamp": session_data["timestamp"].min(),
-                    }
-                )
-        return pd.DataFrame(sessions)
-
-    def filter_items(self, sessions_df):
-        """Filter items by frequency (same logic as Tmall)"""
-        print("Filtering items by frequency...")
-        item_counts = defaultdict(int)
-        for items in sessions_df["items"]:
-            for item in items:
-                item_counts[item] += 1
+        all_items = itertools.chain.from_iterable(sessions_df["items"])
+        item_counts = Counter(all_items)
 
         valid_items = {
             item
@@ -318,115 +76,208 @@ class YoochoosePreprocessor:
             if count >= self.min_item_frequency
         }
 
-        filtered_sessions = []
-        for _, row in sessions_df.iterrows():
-            filtered_items = [item for item in row["items"] if item in valid_items]
-            if len(filtered_items) >= self.min_session_length:
-                row["items"] = filtered_items
-                filtered_sessions.append(row)
-        return pd.DataFrame(filtered_sessions)
+        print("Applying item filter to sessions (in parallel)...")
+        # --- Use parallel_apply instead of apply ---
+        sessions_df["items"] = sessions_df["items"].parallel_apply(
+            lambda session_items: [
+                item for item in session_items if item in valid_items
+            ]
+        )
 
-    def create_item_mapping(self, sessions_df):
-        """Create item ID mapping (same logic as Tmall)"""
+        sessions_df = sessions_df[
+            sessions_df["items"].str.len() >= self.min_session_length
+        ].reset_index(drop=True)
+
+        return sessions_df
+
+    def create_item_mapping(
+        self, sessions_df: pd.DataFrame
+    ) -> Tuple[pd.DataFrame, Dict[int, int], Dict[int, int]]:
+        """Create integer mappings for item IDs."""
         print("Creating item mapping...")
-        all_items = set()
-        for items in sessions_df["items"]:
-            all_items.update(items)
 
-        item_to_id = {item: idx + 1 for idx, item in enumerate(sorted(all_items))}
+        all_items = sorted(
+            list(set(itertools.chain.from_iterable(sessions_df["items"])))
+        )
+
+        item_to_id = {item: idx + 1 for idx, item in enumerate(all_items)}
         id_to_item = {idx: item for item, idx in item_to_id.items()}
 
-        sessions_df["items"] = sessions_df["items"].apply(
+        print("Applying item mapping to sessions (in parallel)...")
+        # --- Use parallel_apply instead of apply ---
+        sessions_df["items"] = sessions_df["items"].parallel_apply(
             lambda x: [item_to_id[item] for item in x]
         )
+
         return sessions_df, item_to_id, id_to_item
 
-    def split_data(self, sessions_df):
-        """Split data into train/validation/test sets by time (same logic as Tmall)"""
+    def split_data(
+        self, sessions_df: pd.DataFrame
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Split data into train, validation, and test sets based on time."""
         print("Splitting data...")
-        sessions_df = sessions_df.sort_values("timestamp")
-
+        sessions_df = sessions_df.sort_values("timestamp").reset_index(drop=True)
         test_start_time = sessions_df["timestamp"].max() - timedelta(
             days=self.test_days
         )
-        test_data = sessions_df[sessions_df["timestamp"] >= test_start_time]
-        train_val_data = sessions_df[sessions_df["timestamp"] < test_start_time]
-
+        is_test = sessions_df["timestamp"] >= test_start_time
+        test_data = sessions_df[is_test]
+        train_val_data = sessions_df[~is_test]
         val_size = int(len(train_val_data) * self.validation_split)
         val_data = train_val_data.tail(val_size)
         train_data = train_val_data.head(len(train_val_data) - val_size)
         return train_data, val_data, test_data
 
-    # The rest of the methods are identical to TmallPreprocessor and can be reused.
-    # For clarity, we include them here.
-    def create_global_graph_data(self, train_sessions):
-        """Create data for global graph construction"""
-        print("Creating global graph data...")
-        cooccurrence = defaultdict(lambda: defaultdict(int))
-        transition = defaultdict(lambda: defaultdict(int))
-        for items in tqdm(train_sessions["items"]):
-            for i in range(len(items)):
-                for j in range(i + 1, min(i + 4, len(items))):
-                    cooccurrence[items[i]][items[j]] += 1
-                    cooccurrence[items[j]][items[i]] += 1
-            for i in range(len(items) - 1):
-                transition[items[i]][items[i + 1]] += 1
-        return dict(cooccurrence), dict(transition)
+    def create_global_graph_data(
+        self, train_sessions: pd.DataFrame
+    ) -> Tuple[Dict, Dict]:
+        """Create co-occurrence and transition graphs from training data in parallel."""
+        print("Creating global graph data (in parallel)...")
 
-    def save_processed_data(
-        self,
-        output_dir,
-        train_data,
-        val_data,
-        test_data,
-        item_to_id,
-        id_to_item,
-        global_graph_data,
-    ):
-        """Save processed data"""
-        print("Saving processed data...")
+        # Use joblib to process each session's graph contribution in parallel
+        # n_jobs=-1 means use all available CPU cores
+        results = Parallel(n_jobs=-1)(
+            delayed(_process_graph_chunk)(items, self.cooccurrence_window)
+            for items in tqdm(train_sessions["items"], desc="Dispatching graph jobs")
+        )
+
+        # Merge the results from all parallel processes
+        final_cooccurrence = defaultdict(lambda: defaultdict(int))
+        final_transition = defaultdict(lambda: defaultdict(int))
+
+        for cooc, trans in tqdm(results, desc="Merging graph results"):
+            for u, neighbors in cooc.items():
+                for v, count in neighbors.items():
+                    final_cooccurrence[u][v] += count
+            for u, neighbors in trans.items():
+                for v, count in neighbors.items():
+                    final_transition[u][v] += count
+
+        return dict(final_cooccurrence), dict(final_transition)
+
+    # The rest of the BasePreprocessor methods (save_processed_data, process) remain the same
+    # ... (code omitted for brevity, it's identical to the previous version)
+
+    def save_processed_data(self, output_dir: str, **kwargs: Any):
+        """Save all processed data artifacts to disk."""
+        print(f"Saving processed data to {output_dir}...")
         os.makedirs(output_dir, exist_ok=True)
-        train_data.to_pickle(os.path.join(output_dir, "train.pkl"))
-        val_data.to_pickle(os.path.join(output_dir, "validation.pkl"))
-        test_data.to_pickle(os.path.join(output_dir, "test.pkl"))
+
+        # Save data splits
+        kwargs["train_data"].to_pickle(os.path.join(output_dir, "train.pkl"))
+        kwargs["val_data"].to_pickle(os.path.join(output_dir, "validation.pkl"))
+        kwargs["test_data"].to_pickle(os.path.join(output_dir, "test.pkl"))
+
+        # Save mappings
+        mappings = {
+            "item_to_id": kwargs["item_to_id"],
+            "id_to_item": kwargs["id_to_item"],
+            "num_items": len(kwargs["item_to_id"]),
+        }
         with open(os.path.join(output_dir, "item_mappings.pkl"), "wb") as f:
-            pickle.dump(
-                {
-                    "item_to_id": item_to_id,
-                    "id_to_item": id_to_item,
-                    "num_items": len(item_to_id),
-                },
-                f,
-            )
+            pickle.dump(mappings, f)
+
+        # Save global graph data
         with open(os.path.join(output_dir, "global_graph_data.pkl"), "wb") as f:
-            pickle.dump(global_graph_data, f)
+            pickle.dump(kwargs["global_graph_data"], f)
+
+        # Save statistics
         stats = {
-            "num_sessions": len(train_data) + len(val_data) + len(test_data),
-            "num_train_sessions": len(train_data),
-            "num_val_sessions": len(val_data),
-            "num_test_sessions": len(test_data),
-            "num_items": len(item_to_id),
-            "avg_session_length": np.mean([len(s) for s in train_data["items"]]),
+            "num_sessions": len(kwargs["train_data"])
+            + len(kwargs["val_data"])
+            + len(kwargs["test_data"]),
+            "num_train_sessions": len(kwargs["train_data"]),
+            "num_val_sessions": len(kwargs["val_data"]),
+            "num_test_sessions": len(kwargs["test_data"]),
+            "num_items": len(kwargs["item_to_id"]),
+            "avg_session_length": np.mean(
+                [len(s) for s in kwargs["train_data"]["items"]]
+            ),
         }
         with open(os.path.join(output_dir, "stats.pkl"), "wb") as f:
             pickle.dump(stats, f)
-        print(f"Data preprocessing completed!\nStatistics: {stats}")
 
-    def process(self, input_file, output_dir):
-        """Main preprocessing pipeline"""
+        print("Data preprocessing completed!")
+        print(f"Statistics: {stats}")
+
+    def process(self, input_file: str, output_dir: str):
+        """Main preprocessing pipeline."""
         data = self.load_raw_data(input_file)
         sessions_df = self.create_sessions(data)
         sessions_df = self.filter_items(sessions_df)
         sessions_df, item_to_id, id_to_item = self.create_item_mapping(sessions_df)
         train_data, val_data, test_data = self.split_data(sessions_df)
         global_graph_data = self.create_global_graph_data(train_data)
+
         self.save_processed_data(
-            output_dir,
-            train_data,
-            val_data,
-            test_data,
-            item_to_id,
-            id_to_item,
-            global_graph_data,
+            output_dir=output_dir,
+            train_data=train_data,
+            val_data=val_data,
+            test_data=test_data,
+            item_to_id=item_to_id,
+            id_to_item=id_to_item,
+            global_graph_data=global_graph_data,
         )
         return train_data, val_data, test_data
+
+
+class TmallPreprocessor(BasePreprocessor):
+    """Preprocessor for the Tmall dataset."""
+
+    def load_raw_data(self, file_path: str) -> pd.DataFrame:
+        print("Loading Tmall raw data...")
+        columns = ["user_id", "item_id", "category_id", "behavior_type", "timestamp"]
+        data = pd.read_csv(file_path, sep=",", header=None, names=columns)
+        data = data[data["behavior_type"] == 0].drop(
+            columns=["behavior_type", "category_id"]
+        )
+        data["timestamp"] = pd.to_datetime(data["timestamp"], unit="s")
+        return data
+
+    def create_sessions(self, data: pd.DataFrame) -> pd.DataFrame:
+        print("Creating sessions (vectorized)...")
+        data = data.sort_values(["user_id", "timestamp"])
+        time_diff = data.groupby("user_id")["timestamp"].diff()
+        session_boundary = (time_diff > timedelta(minutes=30)) | (
+            data["user_id"] != data["user_id"].shift()
+        )
+        session_ids = session_boundary.cumsum()
+        sessions = data.groupby(session_ids).agg(
+            user_id=("user_id", "first"),
+            items=("item_id", list),
+            timestamp=("timestamp", "first"),
+            session_len=("item_id", "size"),
+        )
+        sessions = sessions[
+            sessions["session_len"] >= self.min_session_length
+        ].reset_index(drop=True)
+        return sessions.drop(columns=["session_len"])
+
+
+class YoochoosePreprocessor(BasePreprocessor):
+    """Preprocessor for the Yoochoose dataset."""
+
+    def load_raw_data(self, file_path: str) -> pd.DataFrame:
+        print("Loading Yoochoose raw data...")
+        columns = ["session_id", "timestamp", "item_id", "category"]
+        data = pd.read_csv(
+            file_path, header=None, names=columns, dtype={"category": "str"}
+        )
+        data["timestamp"] = pd.to_datetime(data["timestamp"])
+        return data
+
+    def create_sessions(self, data: pd.DataFrame) -> pd.DataFrame:
+        print("Creating sessions from Yoochoose data (parallelized)...")
+        data = data.sort_values(["session_id", "timestamp"])
+        # Use groupby with pandarallel for large datasets
+        def session_agg(df):
+            return pd.Series({
+                "items": list(df["item_id"]),
+                "timestamp": df["timestamp"].min(),
+                "session_len": len(df["item_id"])
+            })
+        sessions = data.groupby("session_id").parallel_apply(session_agg)
+        sessions = sessions[sessions["session_len"] >= self.min_session_length]
+        sessions = sessions.reset_index()
+        sessions.rename(columns={"session_id": "user_id"}, inplace=True)
+        return sessions[["user_id", "items", "timestamp"]]

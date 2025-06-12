@@ -49,7 +49,7 @@ evaluation:
 # Hardware settings
 device:
   cuda: true
-  gpu_id: 0
+  gpu_id: 1
   num_workers: 4
   
 # Logging settings

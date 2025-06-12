@@ -1,0 +1,71 @@
+# Data and output folders
+RecSysData/
+datasets/
+output/
+logs/
+results/
+checkpoints/
+runs/
+tmp/
+temp/
+.cache/
+.DS_Store
+
+# Python artifacts
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.pkl
+*.joblib
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Large data/model files
+*.log
+*.json
+*.csv
+*.tsv
+*.db
+*.sqlite
+*.h5
+*.pt
+*.pth
+*.onnx
+*.npz
+*.npy
+
+# Compressed files
+*.zip
+*.tar.gz
+*.tar
+*.rar
+*.7z
+
+# System files
+Thumbs.db
+ehthumbs.db
+Icon?
+desktop.ini
+
+# VSCode and IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment files
+.env
+.venv/
+env/
+venv/
+ENV/
+ENV.bak/
+pip-log.txt
+
+# Ignore test outputs
+*.out
+*.err
+
+

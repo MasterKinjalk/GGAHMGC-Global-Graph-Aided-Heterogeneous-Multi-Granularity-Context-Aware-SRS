@@ -119,7 +119,7 @@ def main():
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="datasets/tmall/",
+        default="datasets/yoochoose/",
         help="Path to preprocessed data directory",
     )
     parser.add_argument(
@@ -135,7 +135,7 @@ def main():
 
     # Device configuration
     device = torch.device(
-        "cuda" if torch.cuda.is_available() and config["device"]["cuda"] else "cpu"
+        "cuda:1" if torch.cuda.is_available() and config["device"]["cuda"] else "cpu"
     )
     print(f"Using device: {device}")
 
