@@ -1,0 +1,70 @@
+# GGAHMGC Configuration File
+
+# Dataset settings
+dataset:
+  name: "tmall"
+  path: "./datasets/tmall/"
+  min_session_length: 2
+  min_item_frequency: 5
+  test_days: 7
+  validation_split: 0.1
+
+# Model architecture
+model:
+  embedding_dim: 256
+  hidden_dim: 256
+  num_layers: 2
+  dropout: 0.2
+  
+  # Global graph settings
+  global_graph:
+    num_neighbors: 12
+    aggregator_type: "mean"
+    attention_heads: 8
+    
+  # Multi-granularity settings
+  multi_granularity:
+    max_granularity: 3
+    granularity_dims: [256, 256, 256]
+    
+  # Attention mechanism
+  attention:
+    type: "multi_head"  # Options: "multi_head", "self", "cross"
+    num_heads: 8
+    temperature: 0.1
+    
+# Training settings
+training:
+  batch_size: 100
+  learning_rate: 0.001
+  weight_decay: 1e-5
+  epochs: 30
+  patience: 3
+  gradient_clip: 5.0
+  
+  # Optimizer
+  optimizer: "adam"
+  lr_scheduler:
+    type: "step"
+    step_size: 3
+    gamma: 0.1
+    
+# Evaluation settings
+evaluation:
+  metrics: ["recall", "mrr", "ndcg"]
+  top_k: [10, 20]
+  
+# Hardware settings
+device:
+  cuda: true
+  gpu_id: 0
+  num_workers: 4
+  
+# Logging settings
+logging:
+  save_dir: "./checkpoints/"
+  log_interval: 100
+  tensorboard: true
+  
+# Reproducibility
+seed: 42
