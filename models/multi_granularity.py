@@ -84,22 +84,27 @@ class MultiGranularityEncoder(nn.Module):
         # Initialize node features
         h = {}
 
-        # Set features for each node type
-        for k in range(1, self.max_granularity + 1):
-            node_type = f"gran_{k}"
-            if node_type in hetero_graph.ntypes:
-                if k == 1:
-                    # Level 1: Direct item embeddings
-                    item_ids = hetero_graph.nodes[node_type].data["feat"]
-                    h[node_type] = item_embeddings(item_ids)
-                else:
-                    # Higher levels: Average pooling of constituent items
-                    # This is a simplification - in practice, you'd use learned aggregation
-                    h[node_type] = torch.zeros(
-                        hetero_graph.num_nodes(node_type),
-                        self.embedding_dim,
-                        device=item_embeddings.weight.device,
-                    )
+        # 1. Initialize Level 1 nodes directly from item embeddings
+        if "gran_1" in hetero_graph.ntypes:
+            item_ids = hetero_graph.nodes["gran_1"].data["feat"]
+            h["gran_1"] = item_embeddings(item_ids)
+            hetero_graph.nodes["gran_1"].data["h"] = h["gran_1"]
+
+        # 2. Initialize higher-level nodes by aggregating features from their constituents
+        for k in range(1, self.max_granularity):
+            src_type = f"gran_{k}"
+            dst_type = f"gran_{k + 1}"
+            edge_type = "down_{}".format(k)  # Using the downward edge for aggregation
+
+            if (dst_type, edge_type, src_type) in hetero_graph.canonical_etypes:
+                # Propagate features from lower granularity to higher granularity
+                hetero_graph.update_all(
+                    dgl.function.copy_u("h", "m"),
+                    dgl.function.mean("m", "h_init"),
+                    etype=(dst_type, edge_type, src_type),
+                )
+                h[dst_type] = hetero_graph.nodes[dst_type].data.pop("h_init")
+                hetero_graph.nodes[dst_type].data["h"] = h[dst_type]
 
         # Message passing
         outputs = {}
@@ -153,26 +158,40 @@ class MultiGranularityEncoder(nn.Module):
         # Apply readout and collect representations
         granularity_representations = []
 
+        # First, apply readout to all node types and store the result on the graph
         for k in range(1, self.max_granularity + 1):
             node_type = f"gran_{k}"
             if node_type in outputs:
-                # Apply readout
+                # Apply the readout layer to the node features
                 repr_k = self.readout_layers[node_type](outputs[node_type])
+                # Store the result back onto the nodes of the batched graph
+                hetero_graph.nodes[node_type].data["h_readout"] = repr_k
 
-                # Pool to session level (for now, using mean pooling)
-                session_repr_k = repr_k.mean(dim=0, keepdim=True)
+        # Now, perform a batch-aware aggregation for each granularity level
+        for k in range(1, self.max_granularity + 1):
+            node_type = f"gran_{k}"
+            if "h_readout" in hetero_graph.nodes[node_type].data:
+                # THIS IS THE FIX: dgl.mean_nodes correctly averages over each graph in the batch
+                session_repr_k = dgl.mean_nodes(
+                    hetero_graph, ntype=node_type, feat="h_readout"
+                )
                 granularity_representations.append(session_repr_k)
 
-        # Stack representations
+        # The rest of the fusion logic can remain the same, but we need to stack correctly
         if granularity_representations:
-            granularity_stack = torch.cat(granularity_representations, dim=0)
+            # Stack along a new dimension to get [num_granularities, batch_size, embedding_dim]
+            granularity_stack = torch.stack(granularity_representations, dim=0)
 
             # Apply intent fusion ranking
             weights = F.softmax(
                 self.granularity_weights[: len(granularity_representations)], dim=0
             )
+            # Reshape weights for broadcasting: [num_granularities, 1, 1]
+            weights_reshaped = weights.view(-1, 1, 1)
+
+            # Perform weighted sum over the batch
             fused_representation = torch.sum(
-                granularity_stack * weights.unsqueeze(-1), dim=0
+                granularity_stack * weights_reshaped, dim=0
             )
 
             return fused_representation, granularity_stack, weights
